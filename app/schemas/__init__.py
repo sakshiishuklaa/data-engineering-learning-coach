@@ -48,6 +48,17 @@ from app.schemas.progress import (
     SkillProgressSummary,
     TopicProgressSummary,
 )
+from app.schemas.interview import (
+    InterviewAnswerResult,
+    InterviewAnswerSubmission,
+    InterviewAttemptSummary,
+    InterviewDifficulty,
+    InterviewEvaluation,
+    InterviewMode,
+    InterviewQuestion,
+    InterviewQuestionRequest,
+    InterviewReport,
+)
 
 __all__ = [
     "AssessmentResult",
@@ -87,4 +98,13 @@ __all__ = [
     "QuizPerformanceSummary",
     "SkillProgressSummary",
     "TopicProgressSummary",
+    "InterviewAnswerResult",
+    "InterviewAnswerSubmission",
+    "InterviewAttemptSummary",
+    "InterviewDifficulty",
+    "InterviewEvaluation",
+    "InterviewMode",
+    "InterviewQuestion",
+    "InterviewQuestionRequest",
+    "InterviewReport",
 ]
