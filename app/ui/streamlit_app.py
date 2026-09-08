@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import re
 
 import streamlit as st
 
@@ -12,8 +13,16 @@ from app.database.session import SessionLocal
 from app.logging_config import configure_logging
 from app.schemas.assessment import SkillAssessmentInput
 from app.services.assessment_service import DATA_ENGINEERING_SKILLS, DIAGNOSTIC_QUESTIONS, assess_skills
-from app.services.onboarding_service import SKILL_LEVELS, get_existing_onboarding_profile, save_onboarding_profile
+from app.services.llm_client import GeminiRoadmapLLMClient
+from app.services.onboarding_service import (
+    SKILL_LEVELS,
+    get_existing_onboarding_profile,
+    get_onboarding_profile,
+    save_onboarding_profile,
+)
 from app.services.progress_service import get_progress_dashboard
+from app.services.roadmap_service import generate_personalized_roadmap_for_learner
+from app.ui.dashboard import render_dashboard
 
 settings = get_settings()
 configure_logging(settings.log_level)
@@ -21,6 +30,17 @@ initialize_database()
 st.set_page_config(page_title=settings.app_name, page_icon="🎓")
 st.title("Data Engineering Learning Coach")
 st.caption("Learner onboarding")
+
+NAVIGATION_ITEMS = (
+    "Dashboard",
+    "Roadmap",
+    "Learn",
+    "Practice",
+    "Interview",
+    "Projects",
+    "Progress",
+    "Profile",
+)
 
 
 @contextmanager
@@ -38,6 +58,34 @@ def _choice(label: str, value: str | None) -> str:
 
 def _value(profile: object | None, field: str) -> str:
     return str(getattr(profile, field, "") or "")
+
+
+def _roadmap_generation_diagnostic(error: Exception) -> str:
+    """Return a useful roadmap error without exposing credentials or secrets."""
+    message = str(error)
+    message = re.sub(
+        r"(?i)\b[A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIALS?)\b\s*=\s*[^\s,;]+",
+        "[REDACTED_SENSITIVE_SETTING]",
+        message,
+    )
+    message = re.sub(r"(?i)\bBearer\s+[^\s,;]+", "Bearer [REDACTED]", message)
+    message = re.sub(
+        r"(?i)\b(api[_ -]?key|authorization|token|secret|credential|password)\b\s*[:=]\s*[^\s,;]+",
+        r"\1=[REDACTED]",
+        message,
+    )
+    message = re.sub(r"\b(?:AIza[0-9A-Za-z_-]{20,}|sk-[0-9A-Za-z_-]{16,}|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)\b", "[REDACTED_TOKEN]", message)
+    message = message.replace("\x00", "")[:300]
+    return f"{type(error).__name__}: {message or 'No diagnostic details available.'}"
+
+
+def _roadmap_failure_message(error: str | None, validation_errors: tuple[str, ...]) -> str:
+    """Show returned validation details, falling back to the existing generic error."""
+    fallback = error or "Generated roadmap failed validation."
+    if not validation_errors:
+        return fallback
+    details = "\n".join(f"- {validation_error}" for validation_error in validation_errors)
+    return f"{fallback}\n\nValidation errors:\n{details}"
 
 
 def profile_form(profile: object | None) -> None:
@@ -240,10 +288,53 @@ def progress_dashboard(learner_id: int) -> None:
             st.info("No quiz attempts yet.")
 
 
-with database_session() as session:
-    profile = get_existing_onboarding_profile(session)
+def roadmap_page(learner_id: int) -> None:
+    """Generate and display the learner's in-session personalized roadmap."""
+    st.subheader("Personalized Roadmap")
+    roadmap = st.session_state.get("personalized_roadmap")
+    if roadmap is None:
+        st.info("Generate a roadmap from your completed onboarding profile.")
+        if st.button("Generate Roadmap"):
+            try:
+                llm_client = GeminiRoadmapLLMClient()
+                with database_session() as session:
+                    result = generate_personalized_roadmap_for_learner(session, learner_id, llm_client)
+                if result.success and result.roadmap is not None:
+                    st.session_state.personalized_roadmap = result.roadmap
+                    roadmap = result.roadmap
+                else:
+                    st.error(_roadmap_failure_message(result.error, result.validation_errors))
+            except Exception as error:
+                st.error(f"Roadmap generation failed — {_roadmap_generation_diagnostic(error)}")
 
-if profile is not None and not st.session_state.get("edit_profile", False):
+    if roadmap is None:
+        return
+
+    st.write(
+        f"Target role: {roadmap.target_role} · {roadmap.timeline_weeks} weeks · "
+        f"{roadmap.study_hours_per_week:g} study hours/week"
+    )
+    for phase in roadmap.phases:
+        with st.expander(f"Phase {phase.phase}: {phase.goal}", expanded=phase.phase == 1):
+            st.write(f"Priority: {phase.priority} · Duration: {phase.estimated_duration_weeks} weeks")
+            st.write(f"Topics: {', '.join(phase.topics)}")
+            if phase.prerequisites:
+                st.write(f"Prerequisites: {', '.join(phase.prerequisites)}")
+            st.markdown("**Hands-on exercises**")
+            st.write("\n".join(f"- {exercise}" for exercise in phase.hands_on_exercises))
+            st.write(f"Mini project: {phase.mini_project}")
+            st.markdown("**Interview questions**")
+            st.write("\n".join(f"- {question}" for question in phase.interview_questions))
+            st.markdown("**Completion criteria**")
+            st.write("\n".join(f"- {criterion}" for criterion in phase.completion_criteria))
+
+
+def _render_profile_page(profile: object | None) -> None:
+    """Reuse the existing onboarding profile page."""
+    if profile is None or st.session_state.get("edit_profile", False):
+        profile_form(profile)
+        return
+
     if st.session_state.pop("profile_saved", False):
         st.success("Profile created successfully.")
     st.success("Your onboarding profile is ready.")
@@ -251,7 +342,64 @@ if profile is not None and not st.session_state.get("edit_profile", False):
     if st.button("Edit profile"):
         st.session_state.edit_profile = True
         st.rerun()
-    progress_dashboard(profile.learner_id)
-    assessment_form()
-else:
-    profile_form(profile)
+
+
+def _render_navigation_page(page: str, profile: object | None) -> None:
+    """Route navigation without changing the existing page renderers."""
+    if profile is None:
+        learner_id = st.session_state.get("learner_id")
+        if learner_id is not None:
+            with database_session() as session:
+                profile = get_onboarding_profile(session, int(learner_id))
+
+    if page == "Dashboard":
+        if profile is None:
+            st.info("Complete your profile to open the dashboard.")
+            return
+        with database_session() as session:
+            render_dashboard(
+                session,
+                profile.learner_id,
+                roadmap=st.session_state.get("personalized_roadmap"),
+            )
+        return
+
+    if page == "Progress":
+        if profile is None:
+            st.info("Complete your profile to view progress.")
+            return
+        progress_dashboard(profile.learner_id)
+        return
+
+    if page == "Roadmap":
+        if profile is None:
+            st.info("Complete your profile to generate a roadmap.")
+            return
+        roadmap_page(profile.learner_id)
+        return
+
+    if page == "Profile":
+        _render_profile_page(profile)
+        return
+
+    st.info(f"{page} is not available yet.")
+
+
+def navigation(profile: object | None) -> None:
+    """Display the application navigation and render the selected page."""
+    default_page = "Profile" if profile is None else "Dashboard"
+    selected_page = st.sidebar.radio(
+        "Navigate",
+        NAVIGATION_ITEMS,
+        index=NAVIGATION_ITEMS.index(default_page),
+        key="selected_page",
+    )
+    _render_navigation_page(selected_page, profile)
+
+
+with database_session() as session:
+    profile = get_existing_onboarding_profile(session)
+if profile is not None:
+    st.session_state.learner_id = profile.learner_id
+
+navigation(profile)

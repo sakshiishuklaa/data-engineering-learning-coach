@@ -7,10 +7,35 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.models import Learner, OnboardingProfile
-from app.services.learner_memory_service import create_learner
+from app.models import Learner, OnboardingProfile, Skill
+from app.services.learner_memory_service import (
+    add_skill_to_learner,
+    create_learner,
+    create_skill,
+    get_learner_skill,
+    update_learner_skill_score,
+)
 
 SKILL_LEVELS = ("No experience", "Beginner", "Intermediate", "Advanced")
+SKILL_LEVEL_SCORES = {
+    "No experience": 0.0,
+    "Beginner": 3.0,
+    "Intermediate": 6.0,
+    "Advanced": 8.0,
+}
+ONBOARDING_SKILL_DEFINITIONS = (
+    ("python_level", "Python", "Programming"),
+    ("sql_level", "SQL", "Databases"),
+    ("database_experience", "Databases", "Databases"),
+    ("cloud_experience", "Cloud", "Cloud"),
+    ("git_github_level", "Git", "Developer workflow"),
+    ("linux_level", "Linux", "Developer workflow"),
+    ("etl_elt_level", "ETL/ELT", "Data pipelines"),
+    ("data_warehousing_level", "Data Warehousing", "Analytics engineering"),
+    ("spark_pyspark_level", "Spark/PySpark", "Distributed processing"),
+    ("airflow_orchestration_level", "Orchestration", "Data pipelines"),
+    ("docker_level", "Docker", "DevOps"),
+)
 REQUIRED_TEXT_FIELDS = (
     "current_role",
     "education",
@@ -86,6 +111,24 @@ def get_existing_onboarding_profile(session: Session) -> OnboardingProfile | Non
     return session.scalar(select(OnboardingProfile).order_by(OnboardingProfile.learner_id))
 
 
+def _persist_onboarding_skills(session: Session, learner_id: int, profile: dict[str, Any]) -> None:
+    for field, skill_name, category in ONBOARDING_SKILL_DEFINITIONS:
+        skill = get_skill_by_name(session, skill_name)
+        if skill is None:
+            skill = create_skill(session, name=skill_name, category=category)
+
+        score = SKILL_LEVEL_SCORES[profile[field]]
+        learner_skill = get_learner_skill(session, learner_id, skill.id)
+        if learner_skill is None:
+            add_skill_to_learner(session, learner_id, skill.id, proficiency_score=score, target_score=10)
+        else:
+            update_learner_skill_score(session, learner_id, skill.id, proficiency_score=score, target_score=10)
+
+
+def get_skill_by_name(session: Session, name: str) -> Skill | None:
+    return session.scalar(select(Skill).where(Skill.name == name))
+
+
 def save_onboarding_profile(session: Session, profile: dict[str, Any]) -> OnboardingProfile:
     """Create the local learner/profile pair or update the existing onboarding profile."""
     cleaned = validate_onboarding_profile(profile)
@@ -115,6 +158,7 @@ def save_onboarding_profile(session: Session, profile: dict[str, Any]) -> Onboar
         learner.target_timeline = cleaned["target_timeline"]
         learner.study_hours_per_week = cleaned["study_hours_per_week"]
         learner.preferred_cloud = cleaned["preferred_cloud"]
+    _persist_onboarding_skills(session, learner.id, cleaned)
     session.commit()
     session.refresh(onboarding_profile)
     return onboarding_profile

@@ -12,7 +12,11 @@ from app.services.learner_memory_service import (
     update_project,
 )
 from app.services.skill_gap_service import analyze_skill_gaps
-from app.services.roadmap_service import generate_personalized_roadmap, validate_roadmap
+from app.services.roadmap_service import (
+    generate_personalized_roadmap,
+    generate_personalized_roadmap_for_learner,
+    validate_roadmap,
+)
 from app.services.planner_service import generate_learning_plan
 from app.services.teaching_service import (
     build_teaching_flow,
@@ -46,6 +50,7 @@ __all__ = [
     "update_project",
     "analyze_skill_gaps",
     "generate_personalized_roadmap",
+    "generate_personalized_roadmap_for_learner",
     "validate_roadmap",
     "generate_learning_plan",
     "build_teaching_flow",

@@ -4,10 +4,56 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session, sessionmaker
+
+from app.database.base import Base
+from app.services.onboarding_service import save_onboarding_profile
+import app.services.roadmap_service as roadmap_service
 from app.schemas.assessment import AssessmentResult
 from app.schemas.roadmap import PersonalizedRoadmap, RoadmapGenerationInput
 from app.schemas.skill_gap import LearnerProfileInput, SkillGapAnalysisResult, SkillGapNode
 from app.services.roadmap_service import generate_personalized_roadmap, validate_roadmap
+
+
+@pytest.fixture
+def session() -> Session:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    database_session = sessionmaker(bind=engine, class_=Session)()
+    Base.metadata.create_all(engine)
+    try:
+        yield database_session
+    finally:
+        database_session.close()
+        Base.metadata.drop_all(engine)
+        engine.dispose()
+
+
+def _onboarding_profile() -> dict[str, object]:
+    return {
+        "current_role": "Data Analyst",
+        "experience_years": 2,
+        "education": "Bachelor's degree",
+        "python_level": "Intermediate",
+        "sql_level": "Intermediate",
+        "database_experience": "Beginner",
+        "cloud_experience": "No experience",
+        "git_github_level": "Beginner",
+        "linux_level": "Beginner",
+        "etl_elt_level": "No experience",
+        "data_warehousing_level": "No experience",
+        "spark_pyspark_level": "No experience",
+        "airflow_orchestration_level": "No experience",
+        "docker_level": "No experience",
+        "existing_projects": None,
+        "target_role": "Data Engineer",
+        "target_company_type": "Product company",
+        "preferred_cloud": "AWS",
+        "study_hours_per_week": 8,
+        "target_timeline": "6 months",
+        "learning_preference": "Hands-on projects",
+    }
 
 
 class MockRoadmapLLMClient:
@@ -161,6 +207,14 @@ def test_generates_structured_roadmap_through_mock_llm_client() -> None:
     assert client.response_model is PersonalizedRoadmap
     assert "structured JSON only" in client.prompt
     assert "Known skills to skip as topics" in client.prompt
+    assert "Canonical allowed topic names: ['PySpark', 'Data Modeling', 'Data Warehousing', 'Git']" in client.prompt
+    assert "MUST_LEARN skills that must all be covered: ['PySpark', 'Data Modeling', 'Data Warehousing']" in client.prompt
+    assert "Preserve each learner-specific skill priority exactly as supplied in the skill gaps." in client.prompt
+    assert "GOOD_TO_LEARN skills are useful but are not required MUST_LEARN skills" in client.prompt
+    assert "never promote them to MUST_LEARN merely because they are generally important for a Data Engineer." in client.prompt
+    assert "respect prerequisites" in client.prompt
+    assert "Include every listed MUST_LEARN skill somewhere in the roadmap." in client.prompt
+    assert "Advanced SQL, PySpark DataFrames, or Data Transformations" in client.prompt
     assert all("SQL" not in phase.topics for phase in result.roadmap.phases)
 
 
@@ -202,8 +256,23 @@ def test_llm_failure_returns_graceful_error_without_raw_output() -> None:
 
     assert result.success is False
     assert result.roadmap is None
-    assert result.error == "Roadmap generation failed. Please retry later."
+    assert result.error == "RuntimeError: API key missing"
     assert result.validation_errors == ()
+
+
+def test_llm_failure_error_redacts_credentials() -> None:
+    result = generate_personalized_roadmap(
+        _generation_input(),
+        MockRoadmapLLMClient(
+            error=RuntimeError("Gemini request failed: GEMINI_API_KEY=gemini-secret")
+        ),
+    )
+
+    assert result.success is False
+    assert result.error is not None
+    assert result.error.startswith("RuntimeError: ")
+    assert "gemini-secret" not in result.error
+    assert "[REDACTED" in result.error
 
 
 def test_unparseable_llm_response_returns_graceful_error() -> None:
@@ -214,4 +283,37 @@ def test_unparseable_llm_response_returns_graceful_error() -> None:
 
     assert result.success is False
     assert result.roadmap is None
-    assert result.error == "Roadmap generation failed. Please retry later."
+    assert result.error is not None
+    assert result.error.startswith("ValidationError:")
+
+
+def test_generate_personalized_roadmap_for_learner_builds_persisted_context(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    saved_profile = save_onboarding_profile(session, _onboarding_profile())
+    captured: dict[str, Any] = {}
+
+    def fake_generate(generation_input: RoadmapGenerationInput, llm_client: Any) -> Any:
+        captured["input"] = generation_input
+        captured["client"] = llm_client
+        return roadmap_service.RoadmapGenerationResult(success=True)
+
+    monkeypatch.setattr(roadmap_service, "generate_personalized_roadmap", fake_generate)
+    llm_client = object()
+
+    result = roadmap_service.generate_personalized_roadmap_for_learner(
+        session, saved_profile.learner_id, llm_client
+    )
+
+    generation_input = captured["input"]
+    assert result.success is True
+    assert captured["client"] is llm_client
+    assert generation_input.target_role == "Data Engineer"
+    assert generation_input.target_timeline == "6 months"
+    assert generation_input.weekly_study_hours == 8
+    assert generation_input.learner_profile.current_role == "Data Analyst"
+    assert {skill.skill for skill in generation_input.skill_gap_analysis.nodes} >= {"Python", "PySpark"}
+    assert "Cloud" not in {skill.skill for skill in generation_input.skill_gap_analysis.nodes}
+    assert "Databases" not in {skill.skill for skill in generation_input.skill_gap_analysis.nodes}
+    assert next(node for node in generation_input.skill_gap_analysis.nodes if node.skill == "PySpark").current_score == 0
+    assert all(assessment.current_score >= 1 for assessment in generation_input.skill_assessment)

@@ -7,6 +7,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.database.base import Base
+from app.models import LearnerSkill, Skill
 from app.services.onboarding_service import get_existing_onboarding_profile, save_onboarding_profile, validate_onboarding_profile
 
 
@@ -53,6 +54,95 @@ def test_save_persists_all_onboarding_answers(session: Session, profile_data: di
     assert persisted.spark_pyspark_level == "No experience"
     assert persisted.existing_projects == "Sales dashboard"
     assert persisted.learner.current_role == "Data Analyst"
+
+
+def test_save_creates_expected_canonical_skills(session: Session, profile_data: dict[str, object]) -> None:
+    save_onboarding_profile(session, profile_data)
+
+    skill_names = {skill.name for skill in session.query(Skill).all()}
+    assert skill_names == {
+        "Python",
+        "SQL",
+        "Databases",
+        "Cloud",
+        "Git",
+        "Linux",
+        "ETL/ELT",
+        "Data Warehousing",
+        "Spark/PySpark",
+        "Orchestration",
+        "Docker",
+    }
+
+
+def test_save_creates_learner_skills_for_onboarding_learner(
+    session: Session, profile_data: dict[str, object]
+) -> None:
+    saved = save_onboarding_profile(session, profile_data)
+
+    learner_skills = session.query(LearnerSkill).filter_by(learner_id=saved.learner_id).all()
+    assert len(learner_skills) == 11
+    assert {learner_skill.skill.name for learner_skill in learner_skills} == {
+        "Python",
+        "SQL",
+        "Databases",
+        "Cloud",
+        "Git",
+        "Linux",
+        "ETL/ELT",
+        "Data Warehousing",
+        "Spark/PySpark",
+        "Orchestration",
+        "Docker",
+    }
+
+
+@pytest.mark.parametrize(
+    ("field", "level", "expected_score"),
+    [
+        ("python_level", "No experience", 0),
+        ("python_level", "Beginner", 3),
+        ("python_level", "Intermediate", 6),
+        ("python_level", "Advanced", 8),
+    ],
+)
+def test_save_maps_onboarding_levels_to_learner_skill_scores(
+    session: Session,
+    profile_data: dict[str, object],
+    field: str,
+    level: str,
+    expected_score: int,
+) -> None:
+    profile_data[field] = level
+    saved = save_onboarding_profile(session, profile_data)
+
+    python_skill = session.query(Skill).filter_by(name="Python").one()
+    learner_skill = session.get(LearnerSkill, (saved.learner_id, python_skill.id))
+    assert learner_skill is not None
+    assert learner_skill.proficiency_score == expected_score
+
+
+def test_saving_onboarding_again_does_not_duplicate_learner_skills(
+    session: Session, profile_data: dict[str, object]
+) -> None:
+    first = save_onboarding_profile(session, profile_data)
+    save_onboarding_profile(session, profile_data)
+
+    assert session.query(LearnerSkill).filter_by(learner_id=first.learner_id).count() == 11
+
+
+def test_updating_onboarding_skill_level_updates_existing_learner_skill(
+    session: Session, profile_data: dict[str, object]
+) -> None:
+    first = save_onboarding_profile(session, profile_data)
+    profile_data["python_level"] = "Advanced"
+    save_onboarding_profile(session, profile_data)
+
+    python_skill = session.query(Skill).filter_by(name="Python").one()
+    learner_skill = session.get(LearnerSkill, (first.learner_id, python_skill.id))
+    assert learner_skill is not None
+    assert learner_skill.proficiency_score == 8
+    assert session.query(LearnerSkill).filter_by(learner_id=first.learner_id, skill_id=python_skill.id).count() == 1
 
 
 def test_save_updates_existing_profile_instead_of_creating_another(session: Session, profile_data: dict[str, object]) -> None:
